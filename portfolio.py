@@ -1,4 +1,5 @@
 """Portfolio manager - handles paper trading execution and position management."""
+import json
 import logging
 from datetime import datetime
 
@@ -11,7 +12,7 @@ logger = logging.getLogger("forex.portfolio")
 
 
 class Portfolio:
-    """Manages paper trading portfolio."""
+    """Manages paper trading portfolio with trailing stops and correlation filtering."""
 
     def __init__(self):
         self.balance = self._load_balance()
@@ -29,8 +30,7 @@ class Portfolio:
     @property
     def equity(self) -> float:
         """Current equity = balance + unrealized P&L."""
-        unrealized = self.get_unrealized_pnl()
-        return self.balance + unrealized
+        return self.balance + self.get_unrealized_pnl()
 
     def get_unrealized_pnl(self) -> float:
         """Calculate total unrealized P&L from open positions."""
@@ -47,19 +47,47 @@ class Portfolio:
             total_pnl += pnl
         return total_pnl
 
+    def _check_correlation_limit(self, pair: str, direction: str) -> bool:
+        """Check if opening this position would exceed correlation limits.
+
+        Returns True if OK to trade, False if too correlated with existing positions.
+        """
+        open_trades = db.get_open_trades()
+        if not open_trades:
+            return True
+
+        for group_name, group_pairs in config.CORRELATION_GROUPS.items():
+            if pair not in group_pairs:
+                continue
+
+            # Count existing positions in this correlation group with same direction
+            same_dir_count = 0
+            for trade in open_trades:
+                if trade["pair"] in group_pairs and trade["direction"] == direction:
+                    same_dir_count += 1
+
+            if same_dir_count >= config.MAX_CORRELATED_POSITIONS:
+                logger.info(
+                    f"Correlation limit: {config.PAIR_NAMES.get(pair, pair)} "
+                    f"blocked by group {group_name} ({same_dir_count} existing)"
+                )
+                return False
+
+        return True
+
     def open_trade(self, pair: str, direction: str, signals: dict,
                    entry_price: float, stop_loss: float, take_profit: float,
                    position_size: float) -> int:
         """Open a new paper trade."""
-        # Check max positions
         if db.count_open_positions() >= config.MAX_OPEN_POSITIONS:
             logger.info(f"Max positions reached, skipping {pair}")
             return -1
 
-        # Check if already have position in this pair
-        existing = db.get_open_trades_for_pair(pair)
-        if existing:
+        if db.get_open_trades_for_pair(pair):
             logger.info(f"Already have position in {pair}, skipping")
+            return -1
+
+        if not self._check_correlation_limit(pair, direction):
             return -1
 
         trade_id = db.insert_trade(
@@ -80,7 +108,7 @@ class Portfolio:
         return trade_id
 
     def check_exits(self):
-        """Check all open trades for stop-loss or take-profit hits."""
+        """Check all open trades for SL, TP, and manage trailing stops."""
         open_trades = db.get_open_trades()
 
         for trade in open_trades:
@@ -89,42 +117,96 @@ class Portfolio:
                 continue
 
             pair_name = config.PAIR_NAMES.get(trade["pair"], trade["pair"])
+            entry = trade["entry_price"]
+            sl = trade["stop_loss"]
+            tp = trade["take_profit"]
 
+            # --- Trailing stop logic ---
+            # Calculate how many "R" of profit we're in
+            risk_per_unit = abs(entry - sl)
+            if risk_per_unit > 0:
+                if trade["direction"] == "long":
+                    current_r = (current_price - entry) / risk_per_unit
+                else:
+                    current_r = (entry - current_price) / risk_per_unit
+
+                # Activate trailing stop after TRAILING_ACTIVATION_R profit
+                if current_r >= config.TRAILING_ACTIVATION_R:
+                    new_sl = self._calculate_trailing_stop(
+                        trade, current_price
+                    )
+                    if new_sl is not None and self._is_better_stop(
+                        trade["direction"], new_sl, sl
+                    ):
+                        db.update_stop_loss(trade["id"], new_sl)
+                        sl = new_sl  # Use updated SL for exit check below
+                        logger.info(
+                            f"TRAIL SL {pair_name} -> {new_sl:.5f} "
+                            f"({current_r:.1f}R profit)"
+                        )
+
+            # --- Check exits ---
             if trade["direction"] == "long":
-                # Check stop-loss
-                if current_price <= trade["stop_loss"]:
+                if current_price <= sl:
                     pnl = db.close_trade(trade["id"], current_price, "closed_sl")
                     self.balance += (pnl or 0)
                     self.save_balance()
                     logger.info(f"STOP-LOSS {pair_name} @ {current_price:.5f} PnL={pnl:.2f}")
                     continue
-
-                # Check take-profit
-                if current_price >= trade["take_profit"]:
+                if current_price >= tp:
+                    pnl = db.close_trade(trade["id"], current_price, "closed_tp")
+                    self.balance += (pnl or 0)
+                    self.save_balance()
+                    logger.info(f"TAKE-PROFIT {pair_name} @ {current_price:.5f} PnL={pnl:.2f}")
+                    continue
+            else:
+                if current_price >= sl:
+                    pnl = db.close_trade(trade["id"], current_price, "closed_sl")
+                    self.balance += (pnl or 0)
+                    self.save_balance()
+                    logger.info(f"STOP-LOSS {pair_name} @ {current_price:.5f} PnL={pnl:.2f}")
+                    continue
+                if current_price <= tp:
                     pnl = db.close_trade(trade["id"], current_price, "closed_tp")
                     self.balance += (pnl or 0)
                     self.save_balance()
                     logger.info(f"TAKE-PROFIT {pair_name} @ {current_price:.5f} PnL={pnl:.2f}")
                     continue
 
-            else:  # short
-                if current_price >= trade["stop_loss"]:
-                    pnl = db.close_trade(trade["id"], current_price, "closed_sl")
-                    self.balance += (pnl or 0)
-                    self.save_balance()
-                    logger.info(f"STOP-LOSS {pair_name} @ {current_price:.5f} PnL={pnl:.2f}")
-                    continue
+    def _calculate_trailing_stop(self, trade: dict, current_price: float) -> float:
+        """Calculate new trailing stop level based on ATR."""
+        df = data_feed.fetch_price_data(trade["pair"], period="5d", interval="15m")
+        if df is None or len(df) < 20:
+            return None
 
-                if current_price <= trade["take_profit"]:
-                    pnl = db.close_trade(trade["id"], current_price, "closed_tp")
-                    self.balance += (pnl or 0)
-                    self.save_balance()
-                    logger.info(f"TAKE-PROFIT {pair_name} @ {current_price:.5f} PnL={pnl:.2f}")
-                    continue
+        df = strategy.compute_indicators(df)
+        atr = df["atr"].iloc[-1]
+        if atr is None or atr <= 0:
+            return None
+
+        trail_distance = atr * config.TRAILING_STOP_ATR_MULT
+
+        if trade["direction"] == "long":
+            return round(current_price - trail_distance, 5)
+        else:
+            return round(current_price + trail_distance, 5)
+
+    def _is_better_stop(self, direction: str, new_sl: float, old_sl: float) -> bool:
+        """Check if new stop-loss is tighter (better) than old one."""
+        if direction == "long":
+            return new_sl > old_sl  # Higher SL = tighter for longs
+        else:
+            return new_sl < old_sl  # Lower SL = tighter for shorts
 
     def evaluate_and_trade(self):
-        """Main trading loop iteration - evaluate all pairs and trade."""
+        """Main trading loop iteration."""
         self.check_exits()
+
+        # Session filter — skip new entries outside trading hours
+        if not strategy.is_good_session():
+            logger.info("Outside trading session, skipping new entries")
+            db.record_equity(self.equity, db.count_open_positions())
+            return
 
         for pair in config.FOREX_PAIRS:
             try:
@@ -132,20 +214,15 @@ class Portfolio:
             except Exception as e:
                 logger.error(f"Error evaluating {pair}: {e}", exc_info=True)
 
-        # Record equity snapshot
         db.record_equity(self.equity, db.count_open_positions())
 
     def _evaluate_pair(self, pair: str):
         """Evaluate a single pair for potential entry."""
-        # Skip if already have position
         if db.get_open_trades_for_pair(pair):
             return
-
-        # Skip if max positions reached
         if db.count_open_positions() >= config.MAX_OPEN_POSITIONS:
             return
 
-        # Fetch data
         df = data_feed.fetch_price_data(pair, period="5d", interval="15m")
         if df is None or len(df) < 30:
             return
@@ -155,20 +232,31 @@ class Portfolio:
         combined = strategy.get_weighted_signal(signals)
 
         pair_name = config.PAIR_NAMES.get(pair, pair)
-        logger.debug(f"{pair_name} combined signal: {combined:.3f} | signals: {signals}")
+        logger.debug(f"{pair_name} combined signal: {combined:.3f}")
 
-        # Check if signal is strong enough
+        # Gate 1: Minimum combined signal strength
         if abs(combined) < config.MIN_SIGNAL_STRENGTH:
             return
 
         direction = "long" if combined > 0 else "short"
 
-        # Get trade parameters
-        params = strategy.get_trade_parameters(pair, df, direction)
+        # Gate 2: Minimum agreeing signals (avoid one strong signal dominating)
+        agreeing = strategy.count_agreeing_signals(signals, direction)
+        if agreeing < config.MIN_AGREEING_SIGNALS:
+            logger.debug(
+                f"{pair_name} only {agreeing} agreeing signals, need {config.MIN_AGREEING_SIGNALS}"
+            )
+            return
+
+        # Gate 3: Correlation check
+        if not self._check_correlation_limit(pair, direction):
+            return
+
+        # All gates passed — calculate trade params and enter
+        params = strategy.get_trade_parameters(pair, df, direction, self.balance)
         if params["position_size"] <= 0:
             return
 
-        # Open the trade
         self.open_trade(
             pair=pair,
             direction=direction,
@@ -197,7 +285,6 @@ class Portfolio:
         open_trades = db.get_open_trades()
         prices = data_feed.get_all_latest_prices()
 
-        # Enrich open trades with current P&L
         for trade in open_trades:
             current = prices.get(trade["pair"])
             if current:
@@ -229,4 +316,5 @@ class Portfolio:
             "signal_weights": signal_weights,
             "prices": {config.PAIR_NAMES.get(k, k): v for k, v in prices.items()},
             "running": self.running,
+            "session_active": strategy.is_good_session(),
         }

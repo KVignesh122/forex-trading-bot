@@ -1,10 +1,10 @@
 """Main entry point - starts the trading bot and web dashboard."""
-import asyncio
 import logging
-import signal
+import os
 import sys
 import threading
 import time
+import urllib.request
 
 import uvicorn
 
@@ -27,6 +27,32 @@ logging.basicConfig(
 logger = logging.getLogger("forex.main")
 
 
+def self_ping():
+    """Keep-alive ping to prevent Render free tier from spinning down.
+
+    Pings own /health endpoint every 10 minutes.
+    """
+    url = config.RENDER_URL
+    if not url:
+        logger.info("No RENDER_EXTERNAL_URL set, self-ping disabled")
+        return
+
+    health_url = url.rstrip("/") + "/health"
+    logger.info(f"Self-ping enabled: {health_url} every {config.SELF_PING_INTERVAL}s")
+
+    while True:
+        time.sleep(config.SELF_PING_INTERVAL)
+        try:
+            req = urllib.request.Request(health_url, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    logger.debug("Self-ping OK")
+                else:
+                    logger.warning(f"Self-ping got status {resp.status}")
+        except Exception as e:
+            logger.warning(f"Self-ping failed: {e}")
+
+
 def trading_loop(portfolio: Portfolio):
     """Background thread running the trading strategy."""
     logger.info("Trading loop started")
@@ -35,7 +61,6 @@ def trading_loop(portfolio: Portfolio):
     while True:
         try:
             if portfolio.running:
-                # Run strategy
                 logger.info("--- Running strategy cycle ---")
                 portfolio.evaluate_and_trade()
 
@@ -72,7 +97,7 @@ def trading_loop(portfolio: Portfolio):
 
 def main():
     logger.info("=" * 60)
-    logger.info("FOREX TRADING BOT - Starting up")
+    logger.info("FOREX TRADING BOT v2 - Starting up")
     logger.info("=" * 60)
 
     # Initialize database
@@ -95,8 +120,14 @@ def main():
     trade_thread.start()
     logger.info("Trading loop thread started")
 
+    # Start self-ping keep-alive for Render
+    ping_thread = threading.Thread(target=self_ping, daemon=True)
+    ping_thread.start()
+
     # Start web dashboard
     logger.info(f"Dashboard: http://localhost:{config.WEB_PORT}")
+    if config.RENDER_URL:
+        logger.info(f"Public URL: {config.RENDER_URL}")
     logger.info("=" * 60)
 
     uvicorn.run(

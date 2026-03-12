@@ -151,6 +151,15 @@ def get_open_trades_for_pair(pair: str) -> list:
         return [dict(r) for r in rows]
 
 
+def update_stop_loss(trade_id: int, new_stop_loss: float):
+    """Update stop-loss for trailing stop functionality."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE trades SET stop_loss = ? WHERE id = ? AND status = 'open'",
+            (new_stop_loss, trade_id)
+        )
+
+
 # --- Signal weights ---
 
 def get_signal_weights() -> dict:

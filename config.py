@@ -20,13 +20,41 @@ PAIR_NAMES = {
     "GBPJPY=X": "GBP/JPY",
 }
 
+# Correlation groups — pairs that move together (don't stack same-direction bets)
+CORRELATION_GROUPS = {
+    "EUR_LONG": ["EURUSD=X", "EURGBP=X", "EURJPY=X"],   # All EUR-base pairs
+    "GBP_LONG": ["GBPUSD=X", "GBPJPY=X"],                # All GBP-base pairs
+    "JPY_SHORT": ["USDJPY=X", "EURJPY=X", "GBPJPY=X"],   # All JPY-quote pairs
+    "USD_SHORT": ["EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X"],  # USD-quote
+    "USD_LONG": ["USDJPY=X", "USDCHF=X", "USDCAD=X"],    # USD-base
+}
+
 # Trading parameters
 INITIAL_BALANCE = 100_000.0      # Starting paper balance
-RISK_PER_TRADE = 0.02            # 2% risk per trade
-MAX_OPEN_POSITIONS = 5
+RISK_PER_TRADE = 0.015           # 1.5% risk per trade (slightly conservative)
+MAX_OPEN_POSITIONS = 4           # Reduced to avoid over-exposure
+MAX_CORRELATED_POSITIONS = 2     # Max positions in same correlation group
 STOP_LOSS_ATR_MULT = 1.5         # Stop-loss = 1.5x ATR
 TAKE_PROFIT_ATR_MULT = 3.0       # Take-profit = 3x ATR (2:1 R:R)
-MIN_SIGNAL_STRENGTH = 0.3        # Minimum combined signal to enter trade
+TRAILING_ACTIVATION_R = 1.0      # Activate trailing stop after 1R profit
+TRAILING_STOP_ATR_MULT = 1.0     # Trail stop at 1x ATR behind price
+MIN_SIGNAL_STRENGTH = 0.25       # Minimum combined signal to enter trade
+MIN_AGREEING_SIGNALS = 3         # Minimum number of signals in same direction
+MIN_ADX = 20                     # Minimum ADX for trend trades (skip choppy markets)
+
+# Session-aware trading (UTC hours)
+# London: 07-16, New York: 12-21, Overlap: 12-16 (best volume)
+TRADING_SESSIONS = {
+    "london_open": 7,
+    "london_close": 16,
+    "ny_open": 12,
+    "ny_close": 21,
+    "best_start": 7,        # Trade from London open
+    "best_end": 21,          # Through NY close
+    "overlap_start": 12,     # London-NY overlap (highest liquidity)
+    "overlap_end": 16,
+}
+ONLY_TRADE_SESSIONS = True       # If True, skip trading outside best hours
 
 # Polling intervals (seconds)
 PRICE_POLL_INTERVAL = 60         # Fetch new candles every 60s
@@ -90,6 +118,10 @@ CURRENCY_KEYWORDS = {
         "negative": ["boc cut", "canada recession", "oil crash", "weak loonie"],
     },
 }
+
+# Self-ping keep-alive for Render free tier
+SELF_PING_INTERVAL = 600  # Ping every 10 minutes
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 # Web dashboard
 WEB_HOST = "0.0.0.0"

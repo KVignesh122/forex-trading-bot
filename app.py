@@ -96,6 +96,12 @@ async def get_learning():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/health")
+async def health():
+    """Health check endpoint for self-ping keep-alive."""
+    return JSONResponse({"status": "ok"})
+
+
 @app.get("/api/signals/{pair}")
 async def get_signals(pair: str):
     """Get current signals for a specific pair."""
