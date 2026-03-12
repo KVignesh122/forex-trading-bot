@@ -10,3 +10,5 @@ services:
         value: 10000
       - key: PYTHON_VERSION
         value: 3.12.0
+      - key: RENDER_EXTERNAL_URL
+        value: https://forex-trading-bot-h1z9.onrender.com
